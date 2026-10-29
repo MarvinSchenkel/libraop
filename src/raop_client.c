@@ -30,6 +30,8 @@
 #include "aes.h"
 
 #define MAX_BACKLOG 512
+// head start of a moved timeline's sync packet over the first audio placed on it
+#define SYNC_LEAD_MS 50
 
 #define JACK_STATUS_DISCONNECTED 0
 #define JACK_STATUS_CONNECTED 1
@@ -155,6 +157,10 @@ typedef struct raopcl_s {
 	bool encrypt;
 	bool first_pkt;
 	uint64_t head_ts, pause_ts, start_ts, first_ts;
+	// added to every RTP timestamp on the wire, so that a restart stays above the flushed line
+	uint32_t ts_offset;
+	// first audio after a timeline change waits until then, so the receiver has its sync packet
+	uint64_t sync_lead_ts;
 	uint64_t started_ts;
 	bool flushing;
 	uint16_t   seq_number;
@@ -184,6 +190,7 @@ static void 	*_rtp_timing_thread(void *args);
 static void 	*_rtp_control_thread(void *args);
 static void 	_raopcl_terminate_rtp(struct raopcl_s *p);
 static void 	_raopcl_send_sync(struct raopcl_s *p, bool first);
+static void 	_raopcl_send_sync_at(struct raopcl_s *p, uint64_t timestamp, bool first);
 static bool 	_raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size);
 static bool 	_raopcl_disconnect(struct raopcl_s *p, bool force);
 
@@ -412,6 +419,26 @@ bool raopcl_accept_frames(struct raopcl_s *p)
 			return false;
 		 }
 
+		// the receiver dropped everything up to head_ts: a restart anchored below (a resume re-sends
+		// from one chunk before its start) moves the timeline above it, announced before any audio
+		if (p->state == RAOP_FLUSHED && p->head_ts && !p->sync_lead_ts) {
+			uint64_t restart_ts = p->start_ts ? p->start_ts : now_ts;
+			if (p->pause_ts) restart_ts -= p->start_ts ? p->chunk_len : raopcl_latency(p) + p->chunk_len;
+			if (restart_ts <= p->head_ts) {
+				p->ts_offset += (uint32_t) (p->head_ts + 1 - restart_ts);
+				_raopcl_send_sync_at(p, restart_ts, true);
+				p->sync_lead_ts = now_ts + NTP2TS(MS2NTP(SYNC_LEAD_MS), p->sample_rate);
+			}
+		}
+
+		if (p->sync_lead_ts) {
+			if (now_ts < p->sync_lead_ts) {
+				pthread_mutex_unlock(&p->mutex);
+				return false;
+			}
+			p->sync_lead_ts = 0;
+		}
+
 		// move to streaming only when really flushed - not when timedout
 		if (p->state == RAOP_FLUSHED) {
 			p->first_pkt = first_pkt = true;
@@ -458,7 +485,7 @@ bool raopcl_accept_frames(struct raopcl_s *p)
 				packet = (rtp_audio_pkt_t*) (p->backlog[index].buffer + sizeof(rtp_header_t));
 				packet->hdr.seq[0] = (p->seq_number >> 8) & 0xff;
 				packet->hdr.seq[1] = p->seq_number & 0xff;
-				packet->timestamp = htonl(p->head_ts);
+				packet->timestamp = htonl(p->head_ts + p->ts_offset);
 				packet->hdr.type = 0x60 | (p->first_pkt ? 0x80 : 0);
 				p->first_pkt = false;
 
@@ -566,7 +593,7 @@ bool raopcl_send_chunk(struct raopcl_s *p, uint8_t *sample, int frames, uint64_t
 	p->first_pkt = false;
 	packet->hdr.seq[0] = (p->seq_number >> 8) & 0xff;
 	packet->hdr.seq[1] = p->seq_number & 0xff;
-	packet->timestamp = htonl(p->head_ts);
+	packet->timestamp = htonl(p->head_ts + p->ts_offset);
 	packet->ssrc = htonl(p->ssrc);
 
 	memcpy((uint8_t*) packet + sizeof(rtp_audio_pkt_t), encoded, size);
@@ -795,7 +822,7 @@ bool raopcl_set_progress(struct raopcl_s *p, uint64_t elapsed, uint64_t duration
 	p->started_ts = now - NTP2TS(elapsed, p->sample_rate);
 	end = duration ? p->started_ts + NTP2TS(duration, p->sample_rate) : now;
 
-	sprintf(a, "progress: %u/%u/%u\r\n", (uint32_t) p->started_ts, (uint32_t) now, (uint32_t) end);
+	sprintf(a, "progress: %u/%u/%u\r\n", (uint32_t) (p->started_ts + p->ts_offset), (uint32_t) (now + p->ts_offset), (uint32_t) (end + p->ts_offset));
 
 	return rtspcl_set_parameter(p->rtspcl, a);
 }
@@ -822,7 +849,7 @@ bool raopcl_set_artwork(struct raopcl_s *p, char *content_type, int size, char *
 {
 	if (!p || !p->rtspcl || p->state < RAOP_FLUSHED || !(p->md_caps & MD_ARTWORK)) return false;
 
-	return rtspcl_set_artwork(p->rtspcl, p->head_ts + p->latency_frames, content_type, size, image);
+	return rtspcl_set_artwork(p->rtspcl, p->head_ts + p->ts_offset + p->latency_frames, content_type, size, image);
 }
 
 /*----------------------------------------------------------------------------*/
@@ -834,7 +861,7 @@ bool raopcl_set_daap(struct raopcl_s *p, int count, ...)
 
 	va_start(args, count);
 
-	return rtspcl_set_daap(p->rtspcl, p->head_ts + p->latency_frames, count, args);
+	return rtspcl_set_daap(p->rtspcl, p->head_ts + p->ts_offset + p->latency_frames, count, args);
 }
 
 /*----------------------------------------------------------------------------*/
@@ -1087,6 +1114,9 @@ bool raopcl_connect(struct raopcl_s *p, struct in_addr peer, uint16_t destport, 
 	pthread_mutex_lock(&p->mutex);
 	// as connect might take time, state might already have been set
 	if (p->state == RAOP_DOWN) p->state = RAOP_FLUSHED;
+	// a new session has no flush line to stay above
+	p->ts_offset = 0;
+	p->sync_lead_ts = 0;
 	pthread_mutex_unlock(&p->mutex);
 
 	if (set_volume) {
@@ -1118,10 +1148,10 @@ bool raopcl_flush(struct raopcl_s *p)
 	p->state = RAOP_FLUSHING;
 	p->retransmit = 0;
 	seq_number = p->seq_number;
-	timestamp = p->head_ts;
+	timestamp = p->head_ts + p->ts_offset;
 	pthread_mutex_unlock(&p->mutex);
 
-	LOG_INFO("[%p]: flushing up to s:%u ts:%" PRIu64 "", p, seq_number, timestamp);
+	LOG_INFO("[%p]: flushing up to s:%u ts:%u", p, seq_number, timestamp);
 
 	// everything BELOW these values should be FLUSHED ==> the +1 is mandatory
 	rc = rtspcl_flush(p->rtspcl, seq_number + 1, timestamp + 1);
@@ -1147,7 +1177,7 @@ bool _raopcl_disconnect(struct raopcl_s *p, bool force)
 
 	_raopcl_terminate_rtp(p);
 
-	rc = rtspcl_flush(p->rtspcl, p->seq_number + 1, p->head_ts + 1);
+	rc = rtspcl_flush(p->rtspcl, p->seq_number + 1, p->head_ts + p->ts_offset + 1);
 	rc &= rtspcl_disconnect(p->rtspcl);
 	rc &= rtspcl_remove_all_exthds(p->rtspcl);
 
@@ -1174,7 +1204,7 @@ bool raopcl_repair(struct raopcl_s *p, bool set_volume)
 	_raopcl_terminate_rtp(p);
 
 	// not thread safe, but does not matter really, all we want is "some" flush
-	rc &= rtspcl_flush(p->rtspcl, p->seq_number + 1, p->head_ts + 1);
+	rc &= rtspcl_flush(p->rtspcl, p->seq_number + 1, p->head_ts + p->ts_offset + 1);
 	rc &= rtspcl_disconnect(p->rtspcl);
 	rc &= rtspcl_remove_all_exthds(p->rtspcl);
 
@@ -1218,6 +1248,8 @@ bool raopcl_sanitize(struct raopcl_s *p)
 
 	p->state = RAOP_DOWN;
 	p->head_ts = p->pause_ts = p->start_ts = p->first_ts = 0;
+	p->ts_offset = 0;
+	p->sync_lead_ts = 0;
 	p->first_pkt = false;
 	p->flushing = true;
 
@@ -1229,17 +1261,28 @@ bool raopcl_sanitize(struct raopcl_s *p)
 /*----------------------------------------------------------------------------*/
 void _raopcl_send_sync(struct raopcl_s *raopcld, bool first)
 {
+	// do not send timesync on FLUSHED
+	if (raopcld->state != RAOP_STREAMING) return;
+
+	// first sync is called with mutex locked, so don't block
+	if (!first) pthread_mutex_lock(&raopcld->mutex);
+
+	_raopcl_send_sync_at(raopcld, raopcld->head_ts, first);
+
+	if (!first) pthread_mutex_unlock(&raopcld->mutex);
+}
+
+/*----------------------------------------------------------------------------*/
+static void _raopcl_send_sync_at(struct raopcl_s *raopcld, uint64_t timestamp, bool first)
+{
 	struct sockaddr_in addr;
 	rtp_sync_pkt_t rsp;
-	uint64_t now, timestamp;
+	uint64_t now;
 	int n;
 
 	addr.sin_family = AF_INET;
 	addr.sin_addr = raopcld->peer_addr;
 	addr.sin_port = htons(raopcld->rtp_ports.ctrl.rport);
-
-	// do not send timesync on FLUSHED
-	if (raopcld->state != RAOP_STREAMING) return;
 
 	rsp.hdr.proto = 0x80 | (first ? 0x10 : 0x00);
 	rsp.hdr.type = 0x54 | 0x80;
@@ -1247,10 +1290,6 @@ void _raopcl_send_sync(struct raopcl_s *raopcld, bool first)
 	rsp.hdr.seq[0] = 0;
 	rsp.hdr.seq[1] = 7;
 
-	// first sync is called with mutex locked, so don't block
-	if (!first) pthread_mutex_lock(&raopcld->mutex);
-
-	timestamp = raopcld->head_ts;
 	now = TS2NTP(timestamp, raopcld->sample_rate);
 
 	// set the NTP time in network order
@@ -1258,14 +1297,12 @@ void _raopcl_send_sync(struct raopcl_s *raopcld, bool first)
 	rsp.curr_time.fraction = htonl(now);
 
 	// The DAC time is synchronized with gettime_ms(), minus the latency.
-	rsp.rtp_timestamp = htonl(timestamp);
-	rsp.rtp_timestamp_latency = htonl(timestamp - raopcld->latency_frames);
+	rsp.rtp_timestamp = htonl(timestamp + raopcld->ts_offset);
+	rsp.rtp_timestamp_latency = htonl(timestamp + raopcld->ts_offset - raopcld->latency_frames);
 
 	n = sendto(raopcld->rtp_ports.ctrl.fd, (void*) &rsp, sizeof(rsp), 0, (void*) &addr, sizeof(addr));
 
-	if (!first) pthread_mutex_unlock(&raopcld->mutex);
-
-	LOG_DEBUG("[%p]: sync ntp:%u.%u (ts:%" PRIu64 ")", raopcld, RAOP_SEC(now), RAOP_FRAC(now), raopcld->head_ts);
+	LOG_DEBUG("[%p]: sync ntp:%u.%u (ts:%" PRIu64 ")", raopcld, RAOP_SEC(now), RAOP_FRAC(now), timestamp);
 
 	if (n < 0) LOG_ERROR("[%p]: write error: %s", raopcld, strerror(errno));
 	if (n == 0) LOG_INFO("[%p]: write, disconnected on the other end", raopcld);
